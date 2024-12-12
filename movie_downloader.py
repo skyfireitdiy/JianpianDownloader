@@ -32,8 +32,35 @@ class Video:
         
     def get_episodes(self, downloader):
         """获取剧集列表"""
-        self.episodes = downloader.get_play_urls(self.detail_url)
-        return len(self.episodes) > 0
+        try:
+            if not self.detail_url:
+                return False
+            
+            response = requests.get(self.detail_url, headers=downloader.headers)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            episode_list = soup.find('ul', class_='stui-content__playlist')
+            if not episode_list:
+                return False
+            
+            episodes = []
+            for item in episode_list.find_all('li'):
+                link = item.find('a')
+                if link:
+                    episodes.append({
+                        'title': link.text.strip(),
+                        'url': urljoin(downloader.base_url, link['href'])
+                    })
+            
+            if episodes:
+                self.episodes = episodes
+                return True
+            
+            return False
+            
+        except Exception as e:
+            return False
         
     def select_episode(self, index):
         """选择剧集"""
@@ -86,36 +113,33 @@ class SpeedMonitor:
         self.last_bytes = 0
         self.last_time = time.time()
         self.current_speed = 0
+        self.last_update = time.time()
         
     def add_bytes(self, bytes_count):
         with self.lock:
-            self.downloaded_bytes += bytes_count
             current_time = time.time()
-            time_diff = current_time - self.last_time
+            self.downloaded_bytes += bytes_count
             
             # 每0.5秒更新一次速度
-            if time_diff >= 0.5:
-                bytes_diff = self.downloaded_bytes - self.last_bytes
-                self.current_speed = bytes_diff / time_diff
-                self.last_bytes = self.downloaded_bytes
-                self.last_time = current_time
-            
-    def get_speed(self):
-        with self.lock:
-            return self.current_speed
-            
-    def get_total_bytes(self):
-        with self.lock:
-            return self.downloaded_bytes
+            if current_time - self.last_update >= 0.5:
+                time_diff = current_time - self.last_time
+                if time_diff > 0:
+                    bytes_diff = self.downloaded_bytes - self.last_bytes
+                    self.current_speed = bytes_diff / time_diff
+                    self.last_bytes = self.downloaded_bytes
+                    self.last_time = current_time
+                self.last_update = current_time
             
     def format_speed(self):
-        speed = self.get_speed()
-        if speed > 1024 * 1024:
-            return f"{speed / (1024 * 1024):.2f} MB/s"
-        elif speed > 1024:
-            return f"{speed / 1024:.2f} KB/s"
-        else:
-            return f"{speed:.2f} B/s"
+        with self.lock:
+            if self.current_speed == 0:
+                return "-"
+            elif self.current_speed > 1024 * 1024:
+                return f"{self.current_speed / (1024 * 1024):.2f} MB/s"
+            elif self.current_speed > 1024:
+                return f"{self.current_speed / 1024:.2f} KB/s"
+            else:
+                return f"{self.current_speed:.2f} B/s"
 
 class MovieDownloader:
     def __init__(self, max_workers=48):
@@ -135,14 +159,7 @@ class MovieDownloader:
         
     def print_progress(self, success_count, total_count, speed):
         """打印下载进度"""
-        if self.download_manager and self.download_manager.status_display:
-            return  # 如果正在显示状态，跳过进度输出
-            
-        with self.output_lock:
-            print(f"\r下载进度: {success_count/total_count*100:5.1f}% "
-                  f"({success_count:4d}/{total_count}) "
-                  f"- {speed:>10}        ", 
-                  end='', flush=True)
+        return
         
     def stop_download(self, signum=None, frame=None):
         """停止下载"""
@@ -262,7 +279,6 @@ class MovieDownloader:
         temp_dir = None
         try:
             # 解析视频地址
-            self.console.print("[yellow]正在解析视频地址...[/yellow]")
             response = requests.get(play_url, headers=self.headers)
             response.raise_for_status()
             
@@ -270,10 +286,7 @@ class MovieDownloader:
             video_url = self._extract_video_url(soup)
             
             if not video_url:
-                self.console.print("[red]未找到视频地址[/red]")
                 return False
-            
-            self.console.print("[yellow]获取m3u8内容...[/yellow]")
             
             # 下载主m3u8文件
             m3u8_response = requests.get(video_url, headers=self.headers)
@@ -287,12 +300,10 @@ class MovieDownloader:
                 segments = m3u8_obj.segments
             else:
                 if not m3u8_obj.playlists:
-                    self.console.print("[red]未找到播放列表[/red]")
                     return False
                     
                 sub_m3u8_uri = m3u8_obj.playlists[0].uri
                 sub_m3u8_url = urljoin(video_url, sub_m3u8_uri)
-                self.console.print("[yellow]获取子m3u8内容...[/yellow]")
                 
                 sub_m3u8_response = requests.get(sub_m3u8_url, headers=self.headers)
                 sub_m3u8_response.raise_for_status()
@@ -301,11 +312,8 @@ class MovieDownloader:
                 segments = sub_m3u8_obj.segments
             
             if not segments:
-                self.console.print("[red]未找到视频段[/red]")
                 return False
-            
-            self.console.print(f"[green]找到 {len(segments)} 个视频片段[/green]")
-            
+
             # 创建临时目录和进度文件
             temp_dir = f"{save_path}.downloading"
             os.makedirs(temp_dir, exist_ok=True)
@@ -314,20 +322,33 @@ class MovieDownloader:
             if os.path.exists(progress_file):
                 with open(progress_file, 'r') as f:
                     downloaded_segments = set(int(x.strip()) for x in f.readlines())
-                self.console.print(f"[blue]找到已下载的片段: {len(downloaded_segments)}/{len(segments)}[/blue]")
             
             # 获取未下载的片段
             remaining_segments = [(i, seg) for i, seg in enumerate(segments) if i not in downloaded_segments]
             
             if not remaining_segments:
-                self.console.print("[green]所有片段已下载完成[/green]")
+                return True
             else:
-                self.console.print(f"[yellow]开始下载剩余 {len(remaining_segments)} 个片段...[/yellow]")
-                self.console.print("[cyan]提示: 按 Ctrl+C 可以暂停下载，下次继续时会从断点续传[/cyan]")
-                
                 success_count = len(downloaded_segments)
                 speed_monitor = SpeedMonitor()
+                total_segments = len(segments)
                 
+                # 获取任务ID以更新状态
+                task_id = None
+                if self.download_manager:
+                    for tid, info in self.download_manager.downloads.items():
+                        if info.get('save_path') == save_path:
+                            task_id = tid
+                            break
+
+                def update_progress():
+                    if task_id and self.download_manager:
+                        with self.download_manager.lock:
+                            task = self.download_manager.downloads.get(task_id)
+                            if task and task['status'] == 'downloading':
+                                task['progress'] = (success_count / total_segments) * 100
+                                task['speed'] = speed_monitor.format_speed()
+
                 def download_segment(args):
                     if self.stop_flag:
                         return None, False
@@ -352,6 +373,7 @@ class MovieDownloader:
                                     f.write(chunk)
                                     downloaded_size += len(chunk)
                                     speed_monitor.add_bytes(len(chunk))
+                                    update_progress()  # 更新进度和速度
                         
                         if downloaded_size > 0:
                             with open(progress_file, 'a') as f:
@@ -363,12 +385,10 @@ class MovieDownloader:
                             return index, False
                             
                     except Exception as e:
-                        if not self.stop_flag:
-                            self.console.print(f"[red]片段 {index+1} 下载出错: {e}[/red]")
                         if os.path.exists(ts_path):
                             os.remove(ts_path)
                         return None, False
-                
+
                 try:
                     # 并行下载
                     with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -386,61 +406,33 @@ class MovieDownloader:
                                 index, success = result
                                 if success:
                                     success_count += 1
-                                    self.print_progress(success_count, len(segments), speed_monitor.format_speed())
-                
-                    with self.output_lock:
-                        print()  # 打印换行
+                                    update_progress()  # 更新进度
+
+                    # 合并文件
+                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                    with open(save_path, 'wb') as outfile:
+                        for i in range(len(segments)):
+                            ts_path = os.path.join(temp_dir, f"{i:05d}.ts")
+                            if os.path.exists(ts_path):
+                                with open(ts_path, 'rb') as infile:
+                                    outfile.write(infile.read())
                     
-                    if success_count == len(segments):
-                        # 暂停进度输出
-                        if self.download_manager:
-                            self.download_manager.status_display = True
-                        
-                        try:
-                            # 清除当前行
-                            print("\r" + " " * 100 + "\r", end="", flush=True)
-                            
-                            # 合并文件
-                            self.console.print("\n[yellow]正在合并视频片段...[/yellow]")
-                            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                            with open(save_path, 'wb') as outfile:
-                                for i in range(len(segments)):
-                                    ts_path = os.path.join(temp_dir, f"{i:05d}.ts")
-                                    if os.path.exists(ts_path):
-                                        with open(ts_path, 'rb') as infile:
-                                            outfile.write(infile.read())
-                            
-                            # 删除临时文件
-                            self.console.print("[yellow]清理临时文件...[/yellow]")
-                            shutil.rmtree(temp_dir)
-                            temp_dir = None
-                            
-                            # 检查文件大小
-                            file_size = os.path.getsize(save_path)
-                            if file_size == 0:
-                                self.console.print("[red]下载失败: 文件大小为0[/red]")
-                                os.remove(save_path)
-                                return False
-                            
-                            self.console.print(Panel(f"[green]下载完成: {save_path}\n文件大小: {file_size / (1024*1024):.2f} MB[/green]"))
-                            return True
-                        finally:
-                            # 恢复进度输出
-                            if self.download_manager:
-                                self.download_manager.status_display = False
-                    else:
-                        self.console.print("\n[yellow]下��未完成，下次运行时将继续下载[/yellow]")
+                    # 删除临时文件
+                    shutil.rmtree(temp_dir)
+                    temp_dir = None
+                    
+                    # 检查文件大小
+                    file_size = os.path.getsize(save_path)
+                    if file_size == 0:
+                        os.remove(save_path)
                         return False
+                    
+                    return True
                         
                 except KeyboardInterrupt:
-                    with self.output_lock:
-                        self.console.print("\n[yellow]下载已暂停，下次运行时将继续下载[/yellow]")
                     return False
                     
         except Exception as e:
-            if not self.stop_flag:
-                with self.output_lock:
-                    self.console.print(f"[red]下载失败: {str(e)}[/red]")
             if os.path.exists(save_path):
                 os.remove(save_path)
             return False
@@ -460,15 +452,11 @@ class MovieDownloader:
                     match = re.search(r'"url":"([^"]+)"', script_text)
                     if match:
                         m3u8_url = match.group(1)
-                        # ��理转义的url
                         m3u8_url = m3u8_url.replace('\\/', '/')
-                        print(f"找到m3u8地址: {m3u8_url}")
                         return m3u8_url
                     
-            print("未找到播放器配置信息")
-            
         except Exception as e:
-            print(f"提取视频地址失败: {str(e)}")
+            pass
         return ''
     
     def get_movie_info(self, movie_url):
@@ -478,62 +466,48 @@ class MovieDownloader:
             response.raise_for_status()
             
             soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # 提取基本信息
             info = {}
             
-            # 标题和评分
+            # 提取基本信息
             title_elem = soup.find('h3', class_='title')
             if title_elem:
-                info['title'] = title_elem.text.split('span')[0].strip()
-                score_elem = title_elem.find('span', class_='score')
-                if score_elem:
-                    info['score'] = score_elem.text.strip()
+                try:
+                    title_parts = title_elem.text.split('span')
+                    if title_parts:
+                        info['title'] = title_parts[0].strip()
+                    score_elem = title_elem.find('span', class_='score')
+                    if score_elem:
+                        info['score'] = score_elem.text.strip()
+                except Exception:
+                    pass
             
-            # 提取类型、地区、年份等信息
+            # 提取其他信息
             data_elems = soup.find_all('p', class_='data')
             for elem in data_elems:
-                text = elem.get_text(strip=True)
-                if '类型：' in text:
-                    info['type'] = text.split('类型：')[1].split('地区：')[0].strip()
-                if '地区：' in text:
-                    info['area'] = text.split('地区：')[1].split('年份：')[0].strip()
-                if '年份：' in text:
-                    info['year'] = text.split('年份：')[1].strip()
-                if '主演：' in text:
-                    info['actors'] = text.split('主演：')[1].strip()
-                if '导演：' in text:
-                    info['director'] = text.split('导演：')[1].strip()
+                try:
+                    text = elem.get_text(strip=True)
+                    if '类型：' in text and '地区：' in text:
+                        info['type'] = text.split('类型：')[1].split('地区：')[0].strip()
+                    if '地区：' in text and '年份：' in text:
+                        info['area'] = text.split('地区：')[1].split('年份：')[0].strip()
+                    if '年份：' in text:
+                        info['year'] = text.split('年份：')[1].strip()
+                    if '主演：' in text:
+                        info['actors'] = text.split('主演：')[1].strip()
+                    if '导演：' in text:
+                        info['director'] = text.split('导演：')[1].strip()
+                except Exception:
+                    continue
             
             # 提取简介
             desc_elem = soup.find('div', class_='stui-content__desc')
             if desc_elem:
                 info['description'] = desc_elem.text.strip()
             
-            # 打印影片信息
-            self.console.print("\n[bold yellow]影片信息:[/bold yellow]")
-            if 'title' in info:
-                self.console.print(f"[bold]片名:[/bold] {info['title']}")
-            if 'score' in info:
-                self.console.print(f"[bold]评分:[/bold] {info['score']}")
-            if 'type' in info:
-                self.console.print(f"[bold]类型:[/bold] {info['type']}")
-            if 'area' in info:
-                self.console.print(f"[bold]地区:[/bold] {info['area']}")
-            if 'year' in info:
-                self.console.print(f"[bold]年份:[/bold] {info['year']}")
-            if 'director' in info:
-                self.console.print(f"[bold]导演:[/bold] {info['director']}")
-            if 'actors' in info:
-                self.console.print(f"[bold]主演:[/bold] {info['actors']}")
-            if 'description' in info:
-                self.console.print(f"\n[bold]剧情简介:[/bold]\n{info['description']}")
-            
             return info
             
         except Exception as e:
-            self.console.print(f"[red]获取影片信息失败: {e}[/red]")
-            return None
+            return {}
 
 class DownloadManager:
     """下载管理器"""
@@ -553,14 +527,15 @@ class DownloadManager:
             # 检查文件是否已经存在
             save_path = video.get_episode_path(save_dir, episode_index)
             if save_path and os.path.exists(save_path) and os.path.getsize(save_path) > 0:
-                # 文件已存在且大小大于0，直接标记为已完成
                 self.downloads[task_id] = {
                     'thread': None,
                     'status': 'completed',
                     'progress': 100,
+                    'speed': '-',
                     'video': video,
                     'episode': video.episodes[episode_index],
-                    'save_dir': save_dir
+                    'save_dir': save_dir,
+                    'save_path': save_path  # 添加保存路径
                 }
                 return True
                 
@@ -575,9 +550,11 @@ class DownloadManager:
                 'thread': thread,
                 'status': 'pending',
                 'progress': 0,
+                'speed': '0 B/s',
                 'video': video,
                 'episode': video.episodes[episode_index],
-                'save_dir': save_dir
+                'save_dir': save_dir,
+                'save_path': save_path  # 添加保存路径
             }
             
             thread.start()
@@ -631,47 +608,79 @@ class DownloadManager:
                       
     def print_status(self):
         """打印下载状态"""
-        statuses = self.get_status()
-        if not statuses:
-            return
-            
-        with self.output_lock:
-            self.status_display = True  # 设置状态显示标志
-            # 清除当前行
-            print("\r" + " " * 100 + "\r", end="", flush=True)
-            console.print("\n[bold green]下载任务状态[/bold green]")
-            
-            # 创建状态表格
-            table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
-            table.add_column("序号", style="cyan", width=6)
-            table.add_column("视频", style="white")
-            table.add_column("剧集", style="white")
-            table.add_column("状态", style="white")
-            table.add_column("保存位置", style="white")
-            
-            for i, (task_id, info) in enumerate(statuses.items(), 1):
-                status_style = {
-                    'pending': '[yellow]等待中[/yellow]',
-                    'downloading': '[blue]下载中[/blue]',
-                    'completed': '[green]已完成[/green]',
-                    'failed': '[red]失败[/red]'
-                }.get(info['status'], info['status'])
+        with self.lock:
+            statuses = self.get_status()
+            if not statuses:
+                return
                 
-                table.add_row(
-                    str(i),
-                    info['video'],
-                    info['episode'],
-                    status_style,
-                    info['save_dir']
-                )
-            
-            console.print(table)
-            console.print()  # 添加一个空行
-            self.status_display = False  # 清除状态显示标志
+            with self.output_lock:
+                self.status_display = True
+                console.print("\n[bold green]下载任务状态[/bold green]")
+                
+                # 创建状态表格
+                table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
+                table.add_column("序号", style="cyan", width=6)
+                table.add_column("视频", style="white")
+                table.add_column("剧集", style="white")
+                table.add_column("状态", style="white")
+                table.add_column("进度", style="white")
+                table.add_column("保存位置", style="white")
+                
+                # 计算总下载速度
+                total_speed = 0
+                downloading_count = 0
+                
+                for i, (task_id, info) in enumerate(statuses.items(), 1):
+                    status_style = {
+                        'pending': '[yellow]等待中[/yellow]',
+                        'downloading': '[blue]下载中[/blue]',
+                        'completed': '[green]已完成[/green]',
+                        'failed': '[red]失败[/red]'
+                    }.get(info['status'], info['status'])
+                    
+                    # 获取进度
+                    progress = "100%" if info['status'] == 'completed' else \
+                              "0%" if info['status'] == 'pending' or info['status'] == 'failed' else \
+                              f"{info.get('progress', 0):.1f}%"
+                    
+                    # 累计下载速度
+                    if info['status'] == 'downloading':
+                        downloading_count += 1
+                        speed_str = info.get('speed', '-')
+                        if speed_str.endswith('MB/s'):
+                            total_speed += float(speed_str[:-5]) * 1024 * 1024
+                        elif speed_str.endswith('KB/s'):
+                            total_speed += float(speed_str[:-5]) * 1024
+                        elif speed_str.endswith('B/s'):
+                            total_speed += float(speed_str[:-4])
+                    
+                    table.add_row(
+                        str(i),
+                        info['video'],
+                        info['episode'],
+                        status_style,
+                        progress,
+                        info['save_dir']
+                    )
+                
+                console.print(table)
+                
+                # 显示总下载速度
+                if downloading_count > 0:
+                    if total_speed > 1024 * 1024:
+                        speed_str = f"{total_speed / (1024 * 1024):.2f} MB/s"
+                    elif total_speed > 1024:
+                        speed_str = f"{total_speed / 1024:.2f} KB/s"
+                    else:
+                        speed_str = f"{total_speed:.2f} B/s"
+                    console.print(f"\n[bold blue]当前下载速度: {speed_str}[/bold blue]")
+                
+                console.print()
+                self.status_display = False
 
 def parse_episode_ranges(input_str, max_episodes):
     """解析剧集范围
-    支持的格式:
+    支持格式:
     - 单个数字: "1"
     - 逗号分隔: "1,2,3"
     - 范围: "1-3"
@@ -701,140 +710,207 @@ def parse_episode_ranges(input_str, max_episodes):
     except ValueError as e:
         if str(e).startswith("剧集"):
             raise
-        raise ValueError("输入格式无效，请使用数字、逗号和字符，例如: 1-3,5,7-9")
+        raise ValueError("输入格式无效，请使用数字、逗号和字，例如: 1-3,5,7-9")
 
 def main():
-    # 设置信号处理
-    def signal_handler(signum, frame):
-        console.print("\n[yellow]正在退出程序...[/yellow]")
-        os._exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    try:
-        # 创建下载管理器
-        download_manager = DownloadManager()
-        
-        # 获取并行下载数
+    while True:  # 最外层循环
         try:
-            max_workers = int(input("请输入并行下载数(默认48): ") or "48")
-            if max_workers < 1:
-                print("并行数量必须大于0使用默认值48")
-                max_workers = 48
-        except ValueError:
-            print("输入无效，使用默认值48")
-            max_workers = 48
+            # 创建下载管理器
+            download_manager = DownloadManager()
             
-        downloader = MovieDownloader(max_workers=max_workers)
-        downloader.set_download_manager(download_manager)  # 设置下载管理器引用
-        
-        while True:
-            # 搜索视频
-            keyword = input("\n请输入要搜索的视频名称（直接回车查看下载状态，输入 q 退出）: ")
-            if not keyword:
-                download_manager.print_status()
-                continue
-            if keyword.lower() == 'q':
-                break
-                
-            videos = downloader.search_video(keyword)
-            
-            if not videos:
-                print("未找到相关视频")
-                continue
-                
-            # 选择视频
-            choice = int(input("\n请输入要下载的视频编号: ")) - 1
-            if 0 <= choice < len(videos):
-                video = videos[choice]
-                
-                # 获取并显示影片信息
-                downloader.get_movie_info(video.detail_url)
-                
-                # 获取剧集列表
-                if not video.get_episodes(downloader):
-                    print("获取剧集列表失败")
-                    continue
-                    
-                # 显示剧集列表
-                console.print(f"\n[bold green]剧集列表[/bold green] [blue](共{len(video.episodes)}集)[/blue]")
-                
-                # 创建表格
-                table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
-                table.add_column("序号", style="cyan", width=6, justify="center")
-                table.add_column("剧集", style="white")
-                
-                # 计算每行显示的列数
-                COLUMNS = 4
-                rows = []
-                current_row = []
-                
-                for i, ep in enumerate(video.episodes, 1):
-                    current_row.extend([str(i), ep['title']])
-                    if len(current_row) == COLUMNS * 2:
-                        rows.append(current_row)
-                        current_row = []
-                
-                if current_row:
-                    while len(current_row) < COLUMNS * 2:
-                        current_row.extend(['', ''])
-                    rows.append(current_row)
-                
-                # 添加数据到表格
-                for row in rows:
-                    table.add_row(*row)
-                
-                console.print(table)
-                console.print("\n[cyan]提示: 支持范围选择，例如: 1-3,5,7-9[/cyan]")
-                    
-                # 选择要下载的剧集
-                while True:
-                    try:
-                        ep_choice = input("\n请输入要下载的剧集编号: ")
-                        ep_choices = parse_episode_ranges(ep_choice, len(video.episodes))
-                        break
-                    except ValueError as e:
-                        print(f"错误: {str(e)}")
-                        continue
-                
-                # 设置下载路径
-                default_path = "downloads"
-                console.print(f"\n[cyan]默认下载路径: {os.path.abspath(default_path)}[/cyan]")
-                save_dir = input("请输入保存路径（直接回车使用默认路径）: ").strip() or default_path
-                
-                # 显示实际下载路径
-                save_dir = os.path.expanduser(save_dir)
-                save_dir = os.path.abspath(save_dir)
-                console.print(f"[green]文件将保存到: {save_dir}[/green]")
-                
-                # 确保目录存在
+            # 获取并行下载数
+            while True:
                 try:
-                    os.makedirs(save_dir, exist_ok=True)
-                    if not os.access(save_dir, os.W_OK):
-                        raise PermissionError("没有写入权限")
-                except Exception as e:
-                    console.print(f"[red]创建目录失败: {str(e)}[/red]")
+                    workers_input = input("请输入并行下载数(默认48，输入b返回): ") 
+                    if workers_input.lower() == 'b':
+                        break  # 返回外层循环
+                    max_workers = int(workers_input) if workers_input else 48
+                    if max_workers < 1:
+                        print("并行数量必须大于0，使用默认值48")
+                        max_workers = 48
+                    break
+                except ValueError:
+                    print("输入无效，使用默认值48")
+                    max_workers = 48
+                
+            if workers_input.lower() == 'b':
+                continue  # 继续外层循环
+                
+            downloader = MovieDownloader(max_workers=max_workers)
+            downloader.set_download_manager(download_manager)
+
+            while True:  # 搜索循环
+                keyword = input("\n请输入要搜索的视频名称（直接回车查看下载状态，输入 q 退出，b 返回）: ")
+                if not keyword:
+                    download_manager.print_status()
                     continue
-                
-                # 添加下载任务
-                for ep_idx in ep_choices:
-                    if download_manager.add_download(video, ep_idx, save_dir, downloader):
-                        console.print(f"[green]已添加下载任务: {video.episodes[ep_idx]['title']}[/green]")
-                    else:
-                        console.print(f"[yellow]任务已存在: {video.episodes[ep_idx]['title']}[/yellow]")
-                
-                # ���示当前下载状态
-                download_manager.print_status()
+                if keyword.lower() == 'q':
+                    return  # 退出整个程序
+                if keyword.lower() == 'b':
+                    break  # 返回外层循环
+
+                videos = downloader.search_video(keyword)
+                if not videos:
+                    print("未找到相关视频")
+                    continue
+
+                should_continue_search = False  # 标记是否需要继续搜索循环
+                while True:  # 选择视频循环
+                    # 显示搜索结果
+                    console.print("\n[bold green]搜索结果:[/bold green]")
+                    table = Table(show_header=True, header_style="bold magenta")
+                    table.add_column("序号", style="cyan", width=6)
+                    table.add_column("片名", style="white")
+                    table.add_column("海报", style="blue")
+                    
+                    for i, video in enumerate(videos, 1):
+                        poster_info = "[blue]📷[/blue] " + (video.poster if video.poster else "无海报")
+                        table.add_row(
+                            str(i),
+                            video.title,
+                            poster_info
+                        )
+                    console.print(table)
+
+                    choice = input("\n请输入要下载的视频编号（直接回车查看下载状态，输入b返回）: ")
+                    if not choice:
+                        download_manager.print_status()
+                        continue
+                    if choice.lower() == 'b':
+                        should_continue_search = True  # 标记需要继续搜索
+                        break
+
+                    try:
+                        choice = int(choice) - 1
+                        if 0 <= choice < len(videos):
+                            video = videos[choice]
+                            video_info = downloader.get_movie_info(video.detail_url)
+                            
+                            if not video.get_episodes(downloader):
+                                print("获取剧集列表失败")
+                                continue
+
+                            while True:  # 选择剧集循环
+                                # 显示影片信息
+                                if video_info:
+                                    console.print("\n[bold yellow]影片信息:[/bold yellow]")
+                                    for key, label in [
+                                        ('title', '片名'),
+                                        ('score', '评分'),
+                                        ('type', '类型'),
+                                        ('area', '地区'),
+                                        ('year', '年份'),
+                                        ('director', '导演'),
+                                        ('actors', '主演')
+                                    ]:
+                                        if key in video_info:
+                                            console.print(f"[bold]{label}:[/bold] {video_info[key]}")
+                                    if 'description' in video_info:
+                                        console.print(f"\n[bold]剧情简介:[/bold]\n{video_info['description']}")
+
+                                # 显示剧集列表
+                                console.print(f"\n[bold green]剧集列表[/bold green] [blue](共{len(video.episodes)}集)[/blue]")
+                                
+                                # 创建表格
+                                table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
+                                table.add_column("序号", style="cyan", width=6, justify="center")
+                                table.add_column("剧集", style="white")
+                                
+                                # ���算每显示的列数
+                                COLUMNS = 4
+                                rows = []
+                                current_row = []
+                                
+                                for i, ep in enumerate(video.episodes, 1):
+                                    current_row.extend([str(i), ep['title']])
+                                    if len(current_row) == COLUMNS * 2:
+                                        rows.append(current_row)
+                                        current_row = []
+                                
+                                if current_row:
+                                    while len(current_row) < COLUMNS * 2:
+                                        current_row.extend(['', ''])
+                                    rows.append(current_row)
+                                
+                                # 添加数据到表格
+                                for row in rows:
+                                    table.add_row(*row)
+                                
+                                console.print(table)
+                                console.print("\n[cyan]提示: 支持范围选择，例如: 1-3,5,7-9[/cyan]")
+                                
+                                ep_choice = input("\n请输入要下载的剧集编号（直接回车查看下载状态，输入b返回）: ")
+                                if not ep_choice:
+                                    download_manager.print_status()
+                                    continue
+                                if ep_choice.lower() == 'b':
+                                    break  # 返回到视频选择界面
+
+                                try:
+                                    ep_choices = parse_episode_ranges(ep_choice, len(video.episodes))
+                                    
+                                    # 设置下载路径
+                                    while True:
+                                        default_path = "downloads"
+                                        console.print(f"\n[cyan]默认下载路径: {os.path.abspath(default_path)}[/cyan]")
+                                        save_dir = input("请输入保存路径（直接回车使用默认路径，输入b返回）: ").strip()
+                                        
+                                        if save_dir.lower() == 'b':
+                                            break
+                                        
+                                        save_dir = save_dir or default_path
+                                        save_dir = os.path.expanduser(save_dir)
+                                        save_dir = os.path.abspath(save_dir)
+                                        
+                                        try:
+                                            os.makedirs(save_dir, exist_ok=True)
+                                            if not os.access(save_dir, os.W_OK):
+                                                raise PermissionError("没有写权限")
+                                                
+                                            # 添加下载任务
+                                            for ep_idx in ep_choices:
+                                                if download_manager.add_download(video, ep_idx, save_dir, downloader):
+                                                    console.print(f"[green]已添加下载任务: {video.episodes[ep_idx]['title']}[/green]")
+                                                else:
+                                                    console.print(f"[yellow]任务已存在: {video.episodes[ep_idx]['title']}[/yellow]")
+                                            
+                                            # 显示当前下载状态
+                                            download_manager.print_status()
+                                            break
+                                            
+                                        except Exception as e:
+                                            console.print(f"[red]创建目录失败: {str(e)}[/red]")
+                                            continue
+                                        
+                                    if save_dir.lower() != 'b':
+                                        break
+                                        
+                                except ValueError as e:
+                                    print(f"错误: {str(e)}")
+                                    continue
+
+                        else:
+                            print("无效的选择")
+                            
+                    except ValueError:
+                        print("请输入有效的数字")
+                        continue
+                        
+                if should_continue_search:
+                    continue  # 继续搜索循环
+
+        except KeyboardInterrupt:
+            if download_manager.get_active_count() > 0:
+                console.print("\n[yellow]下载已暂停，下次运行时将继续下载[/yellow]")
+                break
             else:
-                print("无效的选择")
-                
-    except KeyboardInterrupt:
-        console.print("\n[yellow]用户取消操作，正在退出...[/yellow]")
-    except Exception as e:
-        console.print(f"\n[red]发生错误: {str(e)}[/red]")
-    finally:
-        console.print("[yellow]程序已退出[/yellow]")
+                console.print("\n[yellow]用户取消操作，正在退出...[/yellow]")
+                break
+        except Exception as e:
+            console.print(f"\n[red]生错误: {str(e)}[/red]")
+            break
+        
+    console.print("[yellow]程序退出[/yellow]")
 
 if __name__ == "__main__":
     main() 
