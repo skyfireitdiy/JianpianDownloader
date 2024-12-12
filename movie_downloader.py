@@ -219,25 +219,6 @@ class MovieDownloader:
                 except Exception as e:
                     self.console.print(f"[red]搜索失败: {e}[/red]")
                     break
-                    
-        if videos:
-            self.console.print("\n[bold green]搜索结果:[/bold green]")
-            
-            # 创建表格
-            table = Table(show_header=True, header_style="bold magenta")
-            table.add_column("序号", style="cyan", width=6)
-            table.add_column("片名", style="white")
-            table.add_column("海报", style="blue")
-            
-            for i, video in enumerate(videos, 1):
-                poster_info = "[blue]📷[/blue] " + (video.poster if video.poster else "无海报")
-                table.add_row(
-                    str(i),
-                    video.title,
-                    poster_info
-                )
-            
-            self.console.print(table)
             
         return videos
         
