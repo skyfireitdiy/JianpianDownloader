@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
+import os
+import sys
+import re
+import time
+import signal
+import threading
+import concurrent.futures
+import shutil
 import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
-import os
-import re
 from m3u8 import M3U8
-import time
-import concurrent.futures
 from urllib.parse import urljoin
-import shutil
 from threading import Lock
-import signal
 from rich.console import Console
 from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, DownloadColumn
 from rich.panel import Panel
 from rich.text import Text
 from rich.table import Table
-import threading
 from rich import box
 
 console = Console()
@@ -152,6 +153,7 @@ class MovieDownloader:
         self.console = Console()
         self.output_lock = threading.Lock()  # 输出锁
         self.download_manager = None  # 下载管理器引用
+        self.executor = None  # 线程池引用
         
     def set_download_manager(self, manager):
         """设置下载管理器引用"""
@@ -163,9 +165,9 @@ class MovieDownloader:
         
     def stop_download(self, signum=None, frame=None):
         """停止下载"""
-        self.console.print("\n[yellow]接收到停止信号，正在停止下载...[/yellow]")
+        self.console.print("\n[yellow]正在停止所有下载...[/yellow]")
         self.stop_flag = True
-        # 强制退出所有线程
+        # 强制退出
         os._exit(0)
         
     def search_video(self, keyword):
@@ -273,7 +275,7 @@ class MovieDownloader:
             m3u8_response = requests.get(video_url, headers=self.headers)
             m3u8_response.raise_for_status()
             
-            # 解析主m3u8文件
+            # 解m3u8文件
             m3u8_obj = M3U8(m3u8_response.text)
             
             # 获取子m3u8地址
@@ -421,7 +423,7 @@ class MovieDownloader:
             self.stop_flag = False
     
     def _extract_video_url(self, soup):
-        """从播放页面提取视频地址"""
+        """从播放页面取视频地址"""
         try:
             # 查找包含播放器配置的script标签
             scripts = soup.find_all('script')
@@ -543,24 +545,45 @@ class DownloadManager:
             
     def _download_task(self, task_id, video, episode_index, save_dir, downloader):
         """下载任务处理函数"""
-        try:
-            with self.lock:
-                self.downloads[task_id]['status'] = 'downloading'
-                
-            if video.select_episode(episode_index):
-                success = video.download(downloader, save_dir)
-                
+        max_retries = 3  # 最大重试次数
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
                 with self.lock:
-                    self.downloads[task_id]['status'] = 'completed' if success else 'failed'
-            else:
+                    if retry_count > 0:
+                        self.downloads[task_id]['status'] = 'retrying'
+                    else:
+                        self.downloads[task_id]['status'] = 'downloading'
+                    
+                if video.select_episode(episode_index):
+                    success = video.download(downloader, save_dir)
+                    
+                    with self.lock:
+                        if success:
+                            self.downloads[task_id]['status'] = 'completed'
+                            return
+                        else:
+                            self.downloads[task_id]['status'] = 'failed'
+                else:
+                    with self.lock:
+                        self.downloads[task_id]['status'] = 'failed'
+                        self.downloads[task_id]['error'] = '选择剧集失败'
+                        return
+                        
+            except Exception as e:
                 with self.lock:
                     self.downloads[task_id]['status'] = 'failed'
+                    self.downloads[task_id]['error'] = str(e)
+            
+            # 如果到这里，明下载失败，准备重试
+            retry_count += 1
+            if retry_count < max_retries:
+                import time
+                time.sleep(10)  # 等待10秒后重试
+                with self.lock:
+                    self.downloads[task_id]['status'] = f'等待重试 ({retry_count}/{max_retries-1})'
                     
-        except Exception as e:
-            with self.lock:
-                self.downloads[task_id]['status'] = 'failed'
-                self.downloads[task_id]['error'] = str(e)
-                
     def get_status(self):
         """获取所有下载任务的状态"""
         try:
@@ -690,7 +713,7 @@ def parse_episode_ranges(input_str, max_episodes):
     """
     result = set()
     try:
-        # 按逗号分割
+        # 按逗号分割，同时支持中文逗号
         parts = input_str.replace('，', ',').split(',')
         for part in parts:
             part = part.strip()
@@ -712,15 +735,48 @@ def parse_episode_ranges(input_str, max_episodes):
     except ValueError as e:
         if str(e).startswith("剧集"):
             raise
-        raise ValueError("输入格式无效，请使用数字、逗号和字，例如: 1-3,5,7-9")
+        raise ValueError("输入格式无效，请使用数字、逗号和连字符，例如: 1-3,5,7-9")
 
 def main():
     try:
+        # 设置默认下载路径
+        default_path = "downloads"
+        default_save_dir = os.path.abspath(default_path)
+        
         # 创建下载管理器
         download_manager = DownloadManager()
         # 使用默认的并行下载数
         downloader = MovieDownloader(max_workers=48)
         downloader.set_download_manager(download_manager)
+
+        # 注册信号处理
+        signal.signal(signal.SIGINT, downloader.stop_download)
+        signal.signal(signal.SIGTERM, downloader.stop_download)
+
+        # 添加状态监控函数
+        def monitor_status():
+            import threading
+            import time
+            
+            stop_monitor = threading.Event()
+            
+            def status_update():
+                while not stop_monitor.is_set():
+                    console.clear()
+                    console.print("\n[bold blue]下载任务状态 (按回车返回)[/bold blue]")
+                    download_manager.print_status()
+                    time.sleep(1)
+            
+            # 启动状态更新线程
+            update_thread = threading.Thread(target=status_update)
+            update_thread.daemon = True
+            update_thread.start()
+            
+            # 等待用户输入
+            input()
+            stop_monitor.set()
+            update_thread.join()
+            console.print("\n[cyan]返回主界面[/cyan]")
 
         while True:  # 主搜索循环
             # 显示当前下载状态
@@ -729,14 +785,15 @@ def main():
 
             keyword = input("\n[主界面] 请输入要搜索的视频名称（直接回车查看下载状态，输入 q 退出）: ")
             if not keyword:
-                download_manager.print_status()
+                monitor_status()
                 continue
             if keyword.lower() == 'q':
                 if download_manager.get_active_count() > 0:
                     confirm = input("\n当前有正在下载的任务，确定要退出吗？(y/N): ")
                     if confirm.lower() != 'y':
                         continue
-                return  # 退出程序
+                console.print("\n[green]程序已退出，未完成的下载将在下次运行时继续[/green]")
+                os._exit(0)  # 使用os._exit强制退出
 
             # 搜索视频
             videos = downloader.search_video(keyword)
@@ -759,7 +816,7 @@ def main():
 
                 choice = input("\n[视频选择] 请输入要下载的视频编号（直接回车查看下载状态，输入b返回搜索）: ")
                 if not choice:
-                    download_manager.print_status()
+                    monitor_status()
                     continue
                 if choice.lower() == 'b':
                     break  # 返回搜索界面
@@ -818,15 +875,14 @@ def main():
 
                             ep_choice = input("\n[剧集选择] 请输入要下载的剧集编号（直接回车查看下载状态，输入b返回视频选择）: ")
                             if not ep_choice:
-                                download_manager.print_status()
+                                monitor_status()
                                 continue
                             if ep_choice.lower() == 'b':
                                 break  # 返回视频选择
 
                             try:
                                 ep_choices = parse_episode_ranges(ep_choice, len(video.episodes))
-                                default_path = "downloads"
-                                save_dir = os.path.abspath(default_path)
+                                save_dir = default_save_dir
                                 
                                 # 添加下载任务
                                 download_success = False
@@ -861,50 +917,7 @@ def main():
                                             console.print(f"[green]- {task}[/green]")
                                     
                                     # 不等待，直接显示状态并返回
-                                    console.print("\n[bold blue]当前下载状态:[/bold blue]")
-                                    try:
-                                        # 直接尝试获取状态，不使用线程池
-                                        statuses = download_manager.get_status()
-                                        if not statuses:
-                                            console.print("[yellow]暂无下载任务[/yellow]")
-                                        else:
-                                            # 创建状态表格
-                                            table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
-                                            table.add_column("序号", style="cyan", width=6)
-                                            table.add_column("视频", style="white")
-                                            table.add_column("剧集", style="white")
-                                            table.add_column("状态", style="white")
-                                            table.add_column("进度", style="white")
-                                            table.add_column("速度", style="white")
-                                            
-                                            for i, (task_id, info) in enumerate(statuses.items(), 1):
-                                                status_style = {
-                                                    'pending': '[yellow]等待中[/yellow]',
-                                                    'downloading': '[blue]下载中[/blue]',
-                                                    'completed': '[green]已完成[/green]',
-                                                    'failed': '[red]失败[/red]'
-                                                }.get(info['status'], info['status'])
-                                                
-                                                progress = "100%" if info['status'] == 'completed' else \
-                                                          "0%" if info['status'] == 'pending' or info['status'] == 'failed' else \
-                                                          f"{info.get('progress', 0):.1f}%"
-                                                
-                                                speed = info.get('speed', '-')
-                                                
-                                                table.add_row(
-                                                    str(i),
-                                                    info['video'],
-                                                    info['episode'],
-                                                    status_style,
-                                                    progress,
-                                                    speed
-                                                )
-                                            
-                                            console.print(table)
-                                            console.print()
-                                    except Exception as e:
-                                        console.print(f"[yellow]显示状态时出错: {str(e)}[/yellow]")
-                                    
+                                    monitor_status()
                                     break  # 返回到搜索界面
                                 
                             except ValueError as e:
@@ -919,17 +932,9 @@ def main():
                     continue
 
     except KeyboardInterrupt:
-        if download_manager.get_active_count() > 0:
-            console.print("\n[yellow]下载已暂停，下次运行时将继续下载[/yellow]")
-        else:
-            console.print("\n[yellow]用户取消操作，正在退出...[/yellow]")
-    except Exception as e:
-        console.print(f"\n[red]发生错误: {str(e)}[/red]")
-    finally:
-        if download_manager.get_active_count() > 0:
-            console.print("[yellow]程序已退出，未完成的下载将在下次运行时继续[/yellow]")
-        else:
-            console.print("[yellow]程序已退出[/yellow]")
+        console.print("\n[yellow]接收到退出信号[/yellow]")
+        console.print("\n[green]程序已退出，未完成的下载将在下次运行时继续[/green]")
+        os._exit(0)
 
 if __name__ == "__main__":
     main() 
