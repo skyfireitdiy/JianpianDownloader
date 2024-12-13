@@ -34,8 +34,8 @@
 
 1. 克隆仓库：
 ```bash
-git clone https://github.com/skyfireitdiy/movie-downloader.git
-cd movie-downloader
+git clone https://github.com/skyfireitdiy/JianpianDownloader.git
+cd JianpianDownloader
 ```
 
 2. 安装依赖：
@@ -47,7 +47,7 @@ pip install -r requirements.txt
 
 运行程序：
 ```bash
-python movie_downloader.py
+python jianpian-downloader/movie_downloader.py
 ```
 
 ### 基本操作
