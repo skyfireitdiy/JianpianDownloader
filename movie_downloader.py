@@ -19,6 +19,8 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.table import Table
 from rich import box
+import json
+from datetime import datetime
 
 console = Console()
 
@@ -499,6 +501,49 @@ class DownloadManager:
         self.lock = threading.Lock()
         self.output_lock = threading.Lock()  # 输出锁
         self.status_display = False  # 状态显示标志
+        self.task_store = TaskStore()  # 任务存储器
+        
+    def restore_tasks(self, downloader):
+        """恢复未完成的下载任务"""
+        stored_tasks = self.task_store.load_tasks()
+        restored_count = 0
+        
+        for task_id, task_info in stored_tasks.items():
+            if task_info['status'] not in ['completed', 'failed']:
+                # 创建Video对象
+                video = Video(task_info['video_title'], task_info['video_url'])
+                
+                # 重建episode信息
+                episode = {
+                    'title': task_info['episode_title'],
+                    'url': task_info['episode_url']
+                }
+                video.episodes = [episode]
+                
+                # 添加到下载队列
+                thread = threading.Thread(
+                    target=self._download_task,
+                    args=(task_id, video, 0, task_info['save_dir'], downloader),
+                    daemon=True
+                )
+                
+                with self.lock:
+                    self.downloads[task_id] = {
+                        'thread': thread,
+                        'status': 'pending',
+                        'progress': task_info['progress'],
+                        'speed': '0 B/s',
+                        'video': video,
+                        'episode': episode,
+                        'save_dir': task_info['save_dir'],
+                        'save_path': task_info['save_path'],
+                        'created_at': task_info['created_at']
+                    }
+                    
+                thread.start()
+                restored_count += 1
+                
+        return restored_count
         
     def add_download(self, video, episode_index, save_dir, downloader):
         """添加下载任务"""
@@ -518,8 +563,10 @@ class DownloadManager:
                     'video': video,
                     'episode': video.episodes[episode_index],
                     'save_dir': save_dir,
-                    'save_path': save_path  # 添加保存路径
+                    'save_path': save_path,
+                    'created_at': datetime.now().isoformat()
                 }
+                self.task_store.save_tasks(self.downloads)
                 return True
                 
             # 创建新的线程来处理下载
@@ -537,10 +584,12 @@ class DownloadManager:
                 'video': video,
                 'episode': video.episodes[episode_index],
                 'save_dir': save_dir,
-                'save_path': save_path  # 添加保存路径
+                'save_path': save_path,
+                'created_at': datetime.now().isoformat()
             }
             
             thread.start()
+            self.task_store.save_tasks(self.downloads)
             return True
             
     def _download_task(self, task_id, video, episode_index, save_dir, downloader):
@@ -555,6 +604,7 @@ class DownloadManager:
                         self.downloads[task_id]['status'] = 'retrying'
                     else:
                         self.downloads[task_id]['status'] = 'downloading'
+                    self.task_store.save_tasks(self.downloads)
                     
                 if video.select_episode(episode_index):
                     success = video.download(downloader, save_dir)
@@ -709,7 +759,7 @@ def parse_episode_ranges(input_str, max_episodes):
     - 单个数字: "1"
     - 逗号分隔: "1,2,3"
     - 范围: "1-3"
-    - 混合: "1-3,5,7-9"
+    - 合: "1-3,5,7-9"
     """
     result = set()
     try:
@@ -737,6 +787,47 @@ def parse_episode_ranges(input_str, max_episodes):
             raise
         raise ValueError("输入格式无效，请使用数字、逗号和连字符，例如: 1-3,5,7-9")
 
+class TaskStore:
+    """下载任务持久化存储"""
+    def __init__(self, store_path="download_tasks.json"):
+        self.store_path = store_path
+        
+    def save_tasks(self, downloads):
+        """保存下载任务到文件"""
+        try:
+            tasks = {}
+            for task_id, info in downloads.items():
+                tasks[task_id] = {
+                    'video_title': info['video'].title,
+                    'video_url': info['video'].detail_url,
+                    'episode_title': info['episode']['title'],
+                    'episode_url': info['episode']['url'],
+                    'save_dir': info['save_dir'],
+                    'save_path': info['save_path'],
+                    'status': info['status'],
+                    'progress': info['progress'],
+                    'created_at': info.get('created_at', datetime.now().isoformat())
+                }
+            
+            with open(self.store_path, 'w', encoding='utf-8') as f:
+                json.dump(tasks, f, ensure_ascii=False, indent=2)
+                
+        except Exception as e:
+            console.print(f"[red]保存任务失败: {str(e)}[/red]")
+            
+    def load_tasks(self):
+        """从文件加载下载任务"""
+        try:
+            if not os.path.exists(self.store_path):
+                return {}
+                
+            with open(self.store_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+                
+        except Exception as e:
+            console.print(f"[red]加载任务失败: {str(e)}[/red]")
+            return {}
+
 def main():
     try:
         # 设置默认下载路径
@@ -748,7 +839,12 @@ def main():
         # 使用默认的并行下载数
         downloader = MovieDownloader(max_workers=48)
         downloader.set_download_manager(download_manager)
-
+        
+        # 恢复未完成的下载任务
+        restored_count = download_manager.restore_tasks(downloader)
+        if restored_count > 0:
+            console.print(f"\n[green]已恢复 {restored_count} 个未完成的下载任务[/green]")
+            
         # 注册信号处理
         signal.signal(signal.SIGINT, downloader.stop_download)
         signal.signal(signal.SIGTERM, downloader.stop_download)
@@ -782,8 +878,9 @@ def main():
             # 显示当前下载状态
             if download_manager.get_active_count() > 0:
                 download_manager.print_status()
-
-            keyword = input("\n[主界面] 请输入要搜索的视频名称（直接回车查看下载状态，输入 q 退出）: ")
+                
+            # 修改提示文本
+            keyword = input("\n[主界面] 请输入要搜索的视频名称（直接回车查看下载状态，输入 q 退出，输入 t 查看所有任务）: ")
             if not keyword:
                 monitor_status()
                 continue
@@ -793,8 +890,42 @@ def main():
                     if confirm.lower() != 'y':
                         continue
                 console.print("\n[green]程序已退出，未完成的下载将在下次运行时继续[/green]")
-                os._exit(0)  # 使用os._exit强制退出
-
+                os._exit(0)
+            if keyword.lower() == 't':
+                # 显示所有任务历史
+                console.print("\n[bold green]所有下载任务:[/bold green]")
+                table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
+                table.add_column("序号", style="cyan", width=6)
+                table.add_column("视频", style="white")
+                table.add_column("剧集", style="white")
+                table.add_column("状态", style="white")
+                table.add_column("进度", style="white")
+                table.add_column("创建时间", style="white")
+                
+                for i, (task_id, info) in enumerate(sorted(download_manager.downloads.items(), 
+                    key=lambda x: x[1]['created_at'], reverse=True), 1):
+                    status_style = {
+                        'pending': '[yellow]等待中[/yellow]',
+                        'downloading': '[blue]下载中[/blue]',
+                        'completed': '[green]已完成[/green]',
+                        'failed': '[red]失败[/red]'
+                    }.get(info['status'], info['status'])
+                    
+                    created_time = datetime.fromisoformat(info['created_at']).strftime('%Y-%m-%d %H:%M:%S')
+                    
+                    table.add_row(
+                        str(i),
+                        info['video'].title,
+                        info['episode']['title'],
+                        status_style,
+                        f"{info['progress']:.1f}%",
+                        created_time
+                    )
+                
+                console.print(table)
+                input("\n按回车继续...")
+                continue
+                
             # 搜索视频
             videos = downloader.search_video(keyword)
             if not videos:
@@ -852,7 +983,18 @@ def main():
                             # 显示剧集列表
                             console.print(f"\n[bold green]剧集列表[/bold green] [blue](共{len(video.episodes)}集)[/blue]")
                             table = Table(box=box.ROUNDED)
-                            COLUMNS = 4
+                            
+                            # 添加表头
+                            table.add_column("序号", style="cyan", justify="center")
+                            table.add_column("剧集", style="white", justify="left")
+                            table.add_column("序号", style="cyan", justify="center")
+                            table.add_column("剧集", style="white", justify="left")
+                            table.add_column("序号", style="cyan", justify="center")
+                            table.add_column("剧集", style="white", justify="left")
+                            table.add_column("序号", style="cyan", justify="center")
+                            table.add_column("剧集", style="white", justify="left")
+                            
+                            COLUMNS = 4  # 每行显示的剧集数
                             rows = []
                             current_row = []
                             

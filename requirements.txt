@@ -1,0 +1,5 @@
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+m3u8>=3.6.0
+rich>=13.7.0
+tqdm>=4.66.0
