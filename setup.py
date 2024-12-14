@@ -5,13 +5,13 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="jianpian-downloader",
-    version="1.0.0",
+    version="1.0.1",
     author="skyfireitdiy",
     author_email="skyfireitdiy@hotmail.com",
     description="一个优雅的视频下载工具",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/skyfireitdiy/movie-downloader",
+    url="https://github.com/skyfireitdiy/JianpianDownloader",
     packages=find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
@@ -35,7 +35,7 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            "jianpian-dl=movie_downloader:main",
+            "jianpian-dl=jianpian_downloader.movie_downloader:main",
         ],
     },
 )

@@ -17,6 +17,7 @@
   <img src="https://img.shields.io/badge/python-3.7+-blue.svg" alt="Python Version">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg" alt="Platform">
+  <img src="https://img.shields.io/pypi/v/jianpian-downloader.svg" alt="PyPI version">
 </p>
 
 ## ✨ 特性
@@ -32,22 +33,30 @@
 
 ## 🔧 安装
 
+### 方式一：通过 pip 安装（推荐）
+
+```bash
+pip install jianpian-downloader
+```
+
+### 方式二：从源码安装
+
 1. 克隆仓库：
 ```bash
 git clone https://github.com/skyfireitdiy/JianpianDownloader.git
 cd JianpianDownloader
 ```
 
-2. 安装依赖：
+2. 安装依赖并安装：
 ```bash
-pip install -r requirements.txt
+pip install -e .
 ```
 
 ## 🚀 使用
 
-运行程序：
+安装完成后，直接在终端运行：
 ```bash
-python jianpian-downloader/movie_downloader.py
+jianpian-dl
 ```
 
 ### 基本操作
@@ -159,7 +168,7 @@ A: 程序会自动保存下载进度，重启后会自动恢复未完成的任�
 A: 默认保存在程序目录下的 `downloads` 文件夹中，每个视频会创建独立的文件夹。
 
 **Q: 如何修改下载目录？**  
-A: 可以修改程序开头的 `default_path` 变量来更改默认下载目录。
+A: 可以修��程序开头的 `default_path` 变量来更改默认下载目录。
 
 **Q: 下载速度很慢怎么办？**  
 A: 可以尝试：
