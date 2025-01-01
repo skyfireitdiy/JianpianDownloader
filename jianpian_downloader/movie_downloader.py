@@ -268,6 +268,20 @@ class MovieDownloader:
         """下载视频"""
         temp_dir = None
         try:
+            # 检查是否存在未完成的下载
+            temp_dir = f"{save_path}.downloading"
+            progress_file = os.path.join(temp_dir, "progress.txt")
+            downloaded_segments = set()
+            
+            # 如果存在临时目录，说明是断点续传
+            if os.path.exists(temp_dir):
+                if os.path.exists(progress_file):
+                    with open(progress_file, 'r') as f:
+                        downloaded_segments = set(int(x.strip()) for x in f.readlines())
+                    console.print(f"[green]发现未完成的下载，已下载 {len(downloaded_segments)} 个分片[/green]")
+            else:
+                os.makedirs(temp_dir, exist_ok=True)
+
             # 解析视频地址
             response = requests.get(play_url, headers=self.headers)
             response.raise_for_status()
@@ -304,22 +318,12 @@ class MovieDownloader:
             if not segments:
                 return False
 
-            # 创建临时目录和进度文件
-            temp_dir = f"{save_path}.downloading"
-            os.makedirs(temp_dir, exist_ok=True)
-            progress_file = os.path.join(temp_dir, "progress.txt")
-            downloaded_segments = set()
-            
-            # 使用 with 语句确保文件正确关闭
-            if os.path.exists(progress_file):
-                with open(progress_file, 'r') as f:
-                    downloaded_segments = set(int(x.strip()) for x in f.readlines())
-            
             # 获取未下载的片段
             remaining_segments = [(i, seg) for i, seg in enumerate(segments) if i not in downloaded_segments]
             
             if not remaining_segments:
-                return True
+                # 如果所有分片都已下载，直接进行合并
+                success_count = len(segments)
             else:
                 success_count = len(downloaded_segments)
                 speed_monitor = SpeedMonitor()
@@ -413,24 +417,24 @@ class MovieDownloader:
                                 with open(ts_path, 'rb') as infile:
                                     outfile.write(infile.read())
                     
-                    # 删除临时文件
-                    shutil.rmtree(temp_dir)
-                    temp_dir = None
-                    
                     # 检查文件大小
                     file_size = os.path.getsize(save_path)
                     if file_size == 0:
                         os.remove(save_path)
+                        if os.path.exists(temp_dir):
+                            shutil.rmtree(temp_dir)
                         return False
                     
+                    # 下载成功后删除临时目录
+                    if os.path.exists(temp_dir):
+                        shutil.rmtree(temp_dir)
                     return True
                         
                 except KeyboardInterrupt:
                     return False
                     
         except Exception as e:
-            if os.path.exists(save_path):
-                os.remove(save_path)
+            console.print(f"[red]下载失败: {str(e)}[/red]")
             return False
         finally:
             self.stop_flag = False
@@ -514,10 +518,13 @@ class DownloadManager:
         self.status_display = False  # 状态显示标志
         self.task_store = TaskStore()  # 任务存储器
         self.stop_flag = False  # 停止标志
+        self.auto_save_thread = None  # 自动保存线程
         
-        # 启动自动保存线程
-        self.auto_save_thread = threading.Thread(target=self._auto_save_tasks, daemon=True)
-        self.auto_save_thread.start()
+    def start_auto_save(self):
+        """启动自动保存线程"""
+        if self.auto_save_thread is None:
+            self.auto_save_thread = threading.Thread(target=self._auto_save_tasks, daemon=True)
+            self.auto_save_thread.start()
         
     def _auto_save_tasks(self):
         """定期自动保存任务状态"""
@@ -542,32 +549,51 @@ class DownloadManager:
         restored_count = 0
         
         for task_id, task_info in stored_tasks.items():
-            if task_info['status'] not in ['completed', 'failed']:
+            try:
+                # 检查临时目录
+                temp_dir = f"{task_info['save_path']}.downloading"
+                if not os.path.exists(temp_dir):
+                    os.makedirs(temp_dir, exist_ok=True)
+                
                 # 创建Video对象
                 video = Video(task_info['video_title'], task_info['video_url'])
                 
-                # 重建episode信息
-                episode = {
-                    'title': task_info['episode_title'],
-                    'url': task_info['episode_url']
-                }
-                video.episodes = [episode]
+                # 获取剧集列表
+                if not video.get_episodes(downloader):
+                    console.print(f"[yellow]恢复任务失败 {task_id}: 无法获取剧集列表[/yellow]")
+                    continue
                 
-                # 添加到下载队列
+                # 查找对应的剧集
+                episode_index = None
+                for i, ep in enumerate(video.episodes):
+                    if ep['url'] == task_info['episode_url']:
+                        episode_index = i
+                        break
+                
+                if episode_index is None:
+                    console.print(f"[yellow]恢复任务失败 {task_id}: 找不到对应剧集[/yellow]")
+                    continue
+                
+                # 选择剧集
+                if not video.select_episode(episode_index):
+                    console.print(f"[yellow]恢复任务失败 {task_id}: 选择剧集失败[/yellow]")
+                    continue
+                
+                # 添加到下载队列，保持原始状态和进度
                 thread = threading.Thread(
                     target=self._download_task,
-                    args=(task_id, video, 0, task_info['save_dir'], downloader),
+                    args=(task_id, video, episode_index, task_info['save_dir'], downloader),
                     daemon=True
                 )
                 
                 with self.lock:
                     self.downloads[task_id] = {
                         'thread': thread,
-                        'status': 'pending',
-                        'progress': task_info['progress'],
+                        'status': task_info['status'],  # 保持原始状态
+                        'progress': task_info['progress'],  # 保持原始进度
                         'speed': '0 B/s',
                         'video': video,
-                        'episode': episode,
+                        'episode': video.episodes[episode_index],
                         'save_dir': task_info['save_dir'],
                         'save_path': task_info['save_path'],
                         'created_at': task_info['created_at']
@@ -575,7 +601,12 @@ class DownloadManager:
                     
                 thread.start()
                 restored_count += 1
+                console.print(f"[green]已恢复任务: {video.title} - {video.episodes[episode_index]['title']} (进度: {task_info['progress']:.1f}%)[/green]")
                 
+            except Exception as e:
+                console.print(f"[yellow]恢复任务 {task_id} 失败: {str(e)}[/yellow]")
+                continue
+        
         return restored_count
         
     def add_download(self, video, episode_index, save_dir, downloader):
@@ -633,40 +664,66 @@ class DownloadManager:
         while retry_count < max_retries:
             try:
                 with self.lock:
+                    if task_id not in self.downloads:
+                        return
+                        
                     if retry_count > 0:
                         self.downloads[task_id]['status'] = 'retrying'
                     else:
                         self.downloads[task_id]['status'] = 'downloading'
                     self.task_store.save_tasks(self.downloads)
                     
-                if video.select_episode(episode_index):
-                    success = video.download(downloader, save_dir)
-                    
+                # 选择剧集并开始下载
+                if not video.select_episode(episode_index):
                     with self.lock:
-                        if success:
-                            self.downloads[task_id]['status'] = 'completed'
+                        if task_id not in self.downloads:
                             return
-                        else:
-                            self.downloads[task_id]['status'] = 'failed'
-                else:
-                    with self.lock:
                         self.downloads[task_id]['status'] = 'failed'
                         self.downloads[task_id]['error'] = '选择剧集失败'
+                        self.task_store.save_tasks(self.downloads)
+                        return
+                        
+                # 设置下载管理器引用
+                downloader.set_download_manager(self)
+                
+                # 开始下载
+                success = video.download(downloader, save_dir)
+                
+                with self.lock:
+                    if task_id not in self.downloads:
+                        return
+                        
+                    if success:
+                        self.downloads[task_id]['status'] = 'completed'
+                        self.downloads[task_id]['progress'] = 100
+                        self.task_store.save_tasks(self.downloads)
+                        return
+                    elif retry_count == max_retries - 1:
+                        # 如果是最后一次重试，标记为失败
+                        self.downloads[task_id]['status'] = 'failed'
+                        self.task_store.save_tasks(self.downloads)
                         return
                         
             except Exception as e:
                 with self.lock:
-                    self.downloads[task_id]['status'] = 'failed'
-                    self.downloads[task_id]['error'] = str(e)
+                    if task_id not in self.downloads:
+                        return
+                    # 如果是最后一次重试，标记为失败
+                    if retry_count == max_retries - 1:
+                        self.downloads[task_id]['status'] = 'failed'
+                        self.task_store.save_tasks(self.downloads)
+                        return
             
-            # 如果到这里，明下载失败，准备重试
+            # 如果到这里，说明下载失败，准备重试
             retry_count += 1
             if retry_count < max_retries:
-                import time
                 time.sleep(10)  # 等待10秒后重试
                 with self.lock:
+                    if task_id not in self.downloads:
+                        return
                     self.downloads[task_id]['status'] = f'等待重试 ({retry_count}/{max_retries-1})'
-                    
+                    self.task_store.save_tasks(self.downloads)
+
     def get_status(self):
         """获取所有下载任务的状态"""
         try:
@@ -857,13 +914,49 @@ class TaskStore:
             console.print(f"[red]保存任务失败: {str(e)}[/red]")
             
     def load_tasks(self):
-        """从文件加载下载任务"""
+        """从文件加载任务"""
         try:
+            # 检查文件是否存在
             if not os.path.exists(self.store_path):
                 return {}
                 
-            with open(self.store_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
+            # 检查文件大小
+            if os.path.getsize(self.store_path) == 0:
+                os.remove(self.store_path)
+                return {}
+                
+            try:
+                with open(self.store_path, 'r', encoding='utf-8') as f:
+                    tasks = json.load(f)
+                    
+                # 验证任务数据的完整性
+                valid_tasks = {}
+                for task_id, task_info in tasks.items():
+                    required_fields = [
+                        'video_title', 'video_url', 'episode_title', 'episode_url',
+                        'save_dir', 'save_path', 'status', 'progress'
+                    ]
+                    
+                    # 检查必需字段
+                    if all(field in task_info for field in required_fields):
+                        # 检查文件是否已完成
+                        if os.path.exists(task_info['save_path']) and os.path.getsize(task_info['save_path']) > 0:
+                            continue  # 跳过已完成的任务
+                            
+                        # 检查临时目录，但不创建
+                        temp_dir = f"{task_info['save_path']}.downloading"
+                        
+                        # 保留原始状态和进度
+                        valid_tasks[task_id] = task_info
+                    else:
+                        console.print(f"[yellow]跳过无效的任务记录: {task_id}[/yellow]")
+                
+                return valid_tasks
+                
+            except json.JSONDecodeError:
+                console.print("[yellow]任务文件格式错误，将重新创建[/yellow]")
+                os.remove(self.store_path)
+                return {}
                 
         except Exception as e:
             console.print(f"[red]加载任务失败: {str(e)}[/red]")
@@ -886,6 +979,9 @@ def main():
         if restored_count > 0:
             console.print(f"\n[green]已恢复 {restored_count} 个未完成的下载任务[/green]")
             
+        # 启动自动保存线程
+        download_manager.start_auto_save()
+        
         # 注册信号处理
         signal.signal(signal.SIGINT, downloader.stop_download)
         signal.signal(signal.SIGTERM, downloader.stop_download)

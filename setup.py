@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="jianpian-downloader",
-    version="1.0.2",
+    version="1.0.3",
     author="skyfireitdiy",
     author_email="skyfireitdiy@hotmail.com",
     description="一个优雅的视频下载工具",
