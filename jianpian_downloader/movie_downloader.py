@@ -21,6 +21,11 @@ from rich.table import Table
 from rich import box
 import json
 from datetime import datetime
+import resource
+
+# 设置文件描述符软限制和硬限制
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
 
 console = Console()
 
@@ -304,6 +309,8 @@ class MovieDownloader:
             os.makedirs(temp_dir, exist_ok=True)
             progress_file = os.path.join(temp_dir, "progress.txt")
             downloaded_segments = set()
+            
+            # 使用 with 语句确保文件正确关闭
             if os.path.exists(progress_file):
                 with open(progress_file, 'r') as f:
                     downloaded_segments = set(int(x.strip()) for x in f.readlines())
@@ -339,17 +346,18 @@ class MovieDownloader:
                         return None, False
                     
                     index, segment = args
+                    ts_path = os.path.join(temp_dir, f"{index:05d}.ts")
+                    
                     try:
-                        ts_url = urljoin(video_url, segment.uri)
-                        ts_path = os.path.join(temp_dir, f"{index:05d}.ts")
-                        
                         if index in downloaded_segments and os.path.exists(ts_path):
                             return index, True
                         
+                        ts_url = urljoin(video_url, segment.uri)
                         ts_response = requests.get(ts_url, headers=self.headers, stream=True)
                         ts_response.raise_for_status()
                         
                         downloaded_size = 0
+                        # 使用 with 语句确保文件正确关闭
                         with open(ts_path, 'wb') as f:
                             for chunk in ts_response.iter_content(chunk_size=8192):
                                 if self.stop_flag:
@@ -358,9 +366,10 @@ class MovieDownloader:
                                     f.write(chunk)
                                     downloaded_size += len(chunk)
                                     speed_monitor.add_bytes(len(chunk))
-                                    update_progress()  # 更新进度和速度
+                                    update_progress()
                         
                         if downloaded_size > 0:
+                            # 使用 with 语句确保文件正确关闭
                             with open(progress_file, 'a') as f:
                                 f.write(f"{index}\n")
                             return index, True
@@ -375,8 +384,9 @@ class MovieDownloader:
                         return None, False
 
                 try:
-                    # 并行下载
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    # 限制并发数，避免打开太多文件
+                    max_concurrent = min(self.max_workers, 32)  # 限制最大并发数为32
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as executor:
                         futures = [executor.submit(download_segment, args) for args in remaining_segments]
                         for future in concurrent.futures.as_completed(futures):
                             if self.stop_flag:
@@ -391,7 +401,7 @@ class MovieDownloader:
                                 index, success = result
                                 if success:
                                     success_count += 1
-                                    update_progress()  # 更新进度
+                                    update_progress()
 
                     # 合并文件
                     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -399,6 +409,7 @@ class MovieDownloader:
                         for i in range(len(segments)):
                             ts_path = os.path.join(temp_dir, f"{i:05d}.ts")
                             if os.path.exists(ts_path):
+                                # 使用 with 语句确保文件正确关闭
                                 with open(ts_path, 'rb') as infile:
                                     outfile.write(infile.read())
                     
@@ -502,6 +513,28 @@ class DownloadManager:
         self.output_lock = threading.Lock()  # 输出锁
         self.status_display = False  # 状态显示标志
         self.task_store = TaskStore()  # 任务存储器
+        self.stop_flag = False  # 停止标志
+        
+        # 启动自动保存线程
+        self.auto_save_thread = threading.Thread(target=self._auto_save_tasks, daemon=True)
+        self.auto_save_thread.start()
+        
+    def _auto_save_tasks(self):
+        """定期自动保存任务状态"""
+        while not self.stop_flag:
+            try:
+                with self.lock:
+                    self.task_store.save_tasks(self.downloads)
+            except Exception as e:
+                console.print(f"[yellow]自动保存任务状态失败: {str(e)}[/yellow]")
+            time.sleep(5) 
+            
+    def stop(self):
+        """停止下载管理器"""
+        self.stop_flag = True
+        # 确保最后一次保存
+        with self.lock:
+            self.task_store.save_tasks(self.downloads)
         
     def restore_tasks(self, downloader):
         """恢复未完成的下载任务"""
@@ -797,18 +830,26 @@ class TaskStore:
         try:
             tasks = {}
             for task_id, info in downloads.items():
-                tasks[task_id] = {
-                    'video_title': info['video'].title,
-                    'video_url': info['video'].detail_url,
-                    'episode_title': info['episode']['title'],
-                    'episode_url': info['episode']['url'],
-                    'save_dir': info['save_dir'],
-                    'save_path': info['save_path'],
-                    'status': info['status'],
-                    'progress': info['progress'],
-                    'created_at': info.get('created_at', datetime.now().isoformat())
-                }
+                # 只保存未完成和失败的任务，完成的任务不保存
+                if info['status'] != 'completed':
+                    tasks[task_id] = {
+                        'video_title': info['video'].title,
+                        'video_url': info['video'].detail_url,
+                        'episode_title': info['episode']['title'],
+                        'episode_url': info['episode']['url'],
+                        'save_dir': info['save_dir'],
+                        'save_path': info['save_path'],
+                        'status': info['status'],
+                        'progress': info['progress'],
+                        'created_at': info.get('created_at', datetime.now().isoformat())
+                    }
             
+            # 如果没有需要保存的任务，且文件存在，则删除文件
+            if not tasks and os.path.exists(self.store_path):
+                os.remove(self.store_path)
+                return
+                
+            # 否则写入未完成和失败的任务
             with open(self.store_path, 'w', encoding='utf-8') as f:
                 json.dump(tasks, f, ensure_ascii=False, indent=2)
                 
@@ -889,6 +930,8 @@ def main():
                     confirm = input("\n当前有正在下载的任务，确定要退出吗？(y/N): ")
                     if confirm.lower() != 'y':
                         continue
+                # 停止下载管理器并保存最后的状态
+                download_manager.stop()
                 console.print("\n[green]程序已退出，未完成的下载将在下次运行时继续[/green]")
                 os._exit(0)
             if keyword.lower() == 't':
@@ -1075,6 +1118,8 @@ def main():
 
     except KeyboardInterrupt:
         console.print("\n[yellow]接收到退出信号[/yellow]")
+        # 停止下载管理器并保存最后的状态
+        download_manager.stop()
         console.print("\n[green]程序已退出，未完成的下载将在下次运行时继续[/green]")
         os._exit(0)
 
